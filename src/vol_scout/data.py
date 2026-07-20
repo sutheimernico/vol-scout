@@ -44,6 +44,35 @@ import yfinance as yf
 
 _OHLCV_COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
+# The ten-ticker universe (design-decisions table, plan §1): SPY is the main
+# series every headline number is about; the other nine are a robustness set
+# spanning distinct volatility drivers (sector, geography) plus one Europe
+# ETF. Defined once here, reused by `scripts/fetch_data.py` and later by
+# `viz.py`/`app.py` so the universe lives in exactly one place.
+TICKERS: dict[str, str] = {
+    "SPY": "Broad index (main series) -- literature-standard proxy for "
+    "'the market'; every headline number in the README is about SPY.",
+    "AAPL": "Technology (mega-cap) -- most liquid single name globally; "
+    "'normal' large-cap vol regime.",
+    "NVDA": "Technology (semiconductors) -- high-beta growth name; "
+    "stress-tests every model at the high-vol end of the range.",
+    "JPM": "Financials -- systemically important bank; vol regime tied to "
+    "macro/credit/rate cycles, distinct driver from broad-market beta.",
+    "XOM": "Energy -- integrated oil major; vol driven by commodity shocks, "
+    "a third distinct driver.",
+    "JNJ": "Health Care -- diversified pharma/consumer-health; defensive, "
+    "historically low and stable vol.",
+    "PG": "Consumer Staples -- household/personal-care staple; the "
+    "lowest-vol contrast in the set.",
+    "AMZN": "Consumer Discretionary -- e-commerce/cloud mega-cap; liquid, "
+    "moderate-to-high vol.",
+    "CAT": "Industrials -- heavy machinery; economically cyclical, "
+    "macro-cycle-driven vol.",
+    "VGK": "Europe (developed markets) -- Vanguard FTSE Europe ETF, the "
+    "most direct Europe analog to SPY's own role; avoids one "
+    "single-country ETF's idiosyncrasies.",
+}
+
 
 @runtime_checkable
 class PriceProvider(Protocol):
