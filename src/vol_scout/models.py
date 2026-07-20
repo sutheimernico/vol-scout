@@ -58,6 +58,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 from arch import arch_model
+from lightgbm import LGBMRegressor
 
 from vol_scout.data import log_return, multi_day_rv
 
@@ -142,15 +143,25 @@ def _har_feature_frame(rv: pd.Series) -> pd.DataFrame:
     )
 
 
+def _log_direct_target(rv: pd.Series, horizon: int) -> pd.Series:
+    """`log(sum(RV_{o+1..o+horizon}))` read AT `o`, for any `horizon>=1` --
+    `multi_day_rv(rv, horizon).shift(-horizon)` is that sum (h=1 falls out
+    of the same expression, since a rolling sum over 1 day is the day
+    itself). Module docstring's h=22 target definition, ONE implementation
+    shared by HAR-RV's OLS design matrix (`har_rv_coefficients`) and
+    LightGBM's training target (`_lgbm_design_matrix`) -- both "direct"
+    models must provably predict the identical thing, not two independently
+    written expressions that could silently drift apart.
+    """
+    return np.log(multi_day_rv(rv, horizon).shift(-horizon))
+
+
 def har_rv_coefficients(rv: pd.Series, horizon: int) -> np.ndarray:
     """OLS fit (`numpy.linalg.lstsq`) of `log(sum(RV_{o+1..o+horizon}))` on
     `[1, log(RV_o), log(mean(RV_{o-4..o})), log(mean(RV_{o-21..o}))]`, over
     every origin `o` in `rv` where both sides are fully realized (features
     need a full monthly window; the target needs `horizon` more days of
-    history after `o`) -- `multi_day_rv(rv, horizon).shift(-horizon)` is
-    `sum(RV_{o+1..o+horizon})` read AT `o` for any `horizon>=1` (h=1 falls
-    out of the same expression, since a rolling sum over 1 day is the day
-    itself), so h=1 and h=22 share this one implementation.
+    history after `o`).
 
     Returns `[intercept, beta_daily, beta_weekly, beta_monthly]`. Exposed
     directly (not only via `forecast_har_rv`) so a test can verify the OLS
@@ -158,7 +169,7 @@ def har_rv_coefficients(rv: pd.Series, horizon: int) -> np.ndarray:
     independently of the final point-forecast wiring.
     """
     features = _har_feature_frame(rv)
-    target = np.log(multi_day_rv(rv, horizon).shift(-horizon))
+    target = _log_direct_target(rv, horizon)
     design = features.assign(target=target).dropna()
     if len(design) < 4:
         raise ValueError(
@@ -321,8 +332,75 @@ def lgbm_features(df: pd.DataFrame, origin_idx: int) -> dict[str, float]:
     return _lgbm_feature_frame(df).iloc[origin_idx].to_dict()
 
 
+# --- LightGBM contender ----------------------------------------------------
+#
+# Feature-engineered ML contender: two separately-fit `LGBMRegressor`
+# models per origin (module docstring's "direct" convention, same
+# eligibility rule as HAR-RV -- `_log_direct_target` is the one shared
+# target definition both models fit against). Fixed, modest hyperparameters
+# (no tuning, no per-origin search -- ground rule); `random_state`,
+# `n_jobs=1`, and `deterministic=True` together make one call reproducible
+# bit-for-bit under a fixed seed.
+_LGBM_PARAMS: dict = {
+    "n_estimators": 50,
+    "num_leaves": 7,
+    "learning_rate": 0.1,
+    "min_child_samples": 5,
+    "random_state": 0,
+    "n_jobs": 1,
+    "deterministic": True,
+    "verbosity": -1,
+}
+# Arbitrary but generous floor: LightGBM's own `min_child_samples=5` already
+# needs several times that many rows to grow a non-trivial tree at all --
+# this guards against silently fitting on a near-empty design matrix after
+# `dropna()`, same fail-loud-on-insufficient-history spirit as HAR-RV's
+# `>=4` OLS-parameter check.
+_LGBM_MIN_TRAINING_ROWS = 30
+
+
+def _lgbm_design_matrix(train_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """Feature/target frame for one horizon's `LGBMRegressor` fit:
+    `_lgbm_feature_frame` columns plus `_log_direct_target(rv, horizon)` --
+    the same target expression `har_rv_coefficients` fits against, so
+    HAR-RV and LightGBM are provably predicting the identical thing. Rows
+    with any NaN (insufficient lag/gap/target history) are dropped, same
+    convention as `har_rv_coefficients`'s design matrix.
+    """
+    features = _lgbm_feature_frame(train_df)
+    target = _log_direct_target(train_df["rv"], horizon)
+    return features.assign(target=target).dropna()
+
+
+def forecast_lgbm(train_df: pd.DataFrame) -> ForecastResult:
+    """Feature-engineered LightGBM contender: two separately-fit
+    `LGBMRegressor` models (h=1, h=22 -- module docstring's "direct"
+    convention), applied once to the cutoff origin (`train_df`'s last row)
+    and exponentiated back to variance scale.
+    """
+    start = time.perf_counter()
+    cutoff_features = _lgbm_feature_frame(train_df)[_LGBM_FEATURE_COLUMNS].iloc[[-1]]
+
+    point: dict[int, float] = {}
+    for horizon in (1, 22):
+        design = _lgbm_design_matrix(train_df, horizon)
+        if len(design) < _LGBM_MIN_TRAINING_ROWS:
+            raise ValueError(
+                f"forecast_lgbm needs >={_LGBM_MIN_TRAINING_ROWS} fully-realized "
+                f"training origins for horizon={horizon}, got {len(design)}"
+            )
+        model = LGBMRegressor(**_LGBM_PARAMS)
+        model.fit(design[_LGBM_FEATURE_COLUMNS], design["target"])
+        pred_log = model.predict(cutoff_features)[0]
+        point[horizon] = math.exp(float(pred_log))
+
+    elapsed = time.perf_counter() - start
+    return ForecastResult(point=point, fit_predict_seconds=elapsed)
+
+
 MODEL_REGISTRY: dict[str, Callable[[pd.DataFrame], ForecastResult]] = {
     "random_walk": forecast_random_walk,
     "har_rv": forecast_har_rv,
     "garch": forecast_garch,
+    "lgbm": forecast_lgbm,
 }

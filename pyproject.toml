@@ -13,6 +13,7 @@ dependencies = [
     "chronos-forecasting>=2.0",
     "matplotlib>=3.9",
     "streamlit>=1.40",
+    "scikit-learn>=1.5",
 ]
 
 [dependency-groups]

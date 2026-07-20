@@ -17,10 +17,12 @@ from arch.utility.exceptions import DataScaleWarning
 
 from vol_scout.data import multi_day_rv
 from vol_scout.models import (
+    MODEL_REGISTRY,
     ForecastResult,
     _har_feature_frame,
     forecast_garch,
     forecast_har_rv,
+    forecast_lgbm,
     forecast_random_walk,
     har_features,
     har_rv_coefficients,
@@ -384,3 +386,54 @@ def test_lgbm_calendar_features_depend_only_on_origin_timestamp():
     assert features["day_of_week"] == float(ts.dayofweek)
     assert features["month"] == float(ts.month)
     assert features["is_month_end"] == float(ts.is_month_end)
+
+
+# --- forecast_lgbm --------------------------------------------------------
+
+
+def test_forecast_lgbm_returns_finite_positive_both_horizons():
+    intercept, beta_d, beta_w, beta_m = _HAR_GENERATING_COEFFICIENTS
+    rv = _simulate_har_process(
+        n=300, intercept=intercept, beta_d=beta_d, beta_w=beta_w, beta_m=beta_m,
+        noise_std=0.02, seed=3,
+    )
+    df = _ohlcv_rv_df(rv)
+
+    result = forecast_lgbm(df)
+
+    assert isinstance(result, ForecastResult)
+    assert math.isfinite(result.point[1])
+    assert math.isfinite(result.point[22])
+    assert result.point[1] > 0.0
+    assert result.point[22] > 0.0
+
+
+def test_forecast_lgbm_smoke_correlates_with_known_har_generating_signal():
+    # Same generating process M2.2's HAR-RV OLS-recovery test uses. The
+    # noiseless one-step-ahead expectation at the cutoff is exactly known
+    # from the generating coefficients themselves (no need to peek at
+    # forecast_har_rv's own fitted output -- that would just be comparing
+    # two learned estimates to each other). LightGBM sees the identical
+    # lag_1/5/22 information HAR-RV's OLS does (plus extras); it should
+    # land in the same ballpark as this noiseless expectation, not an exact
+    # match (GBDT on one noisy draw != closed-form OLS) -- a generous
+    # factor-of-3 band both ways is loose enough not to be flaky while
+    # still catching a genuinely broken pipeline (wrong target column,
+    # forgetting to exponentiate the log-scale output, etc.).
+    intercept, beta_d, beta_w, beta_m = _HAR_GENERATING_COEFFICIENTS
+    rv = _simulate_har_process(
+        n=300, intercept=intercept, beta_d=beta_d, beta_w=beta_w, beta_m=beta_m,
+        noise_std=0.02, seed=3,
+    )
+    df = _ohlcv_rv_df(rv)
+    cutoff_idx = len(rv) - 1
+    log_d, log_w, log_m = har_features(rv, cutoff_idx)
+    expected_rv_h1 = math.exp(intercept + beta_d * log_d + beta_w * log_w + beta_m * log_m)
+
+    result = forecast_lgbm(df)
+
+    assert expected_rv_h1 / 3.0 < result.point[1] < expected_rv_h1 * 3.0
+
+
+def test_lgbm_registered_in_model_registry():
+    assert MODEL_REGISTRY["lgbm"] is forecast_lgbm
