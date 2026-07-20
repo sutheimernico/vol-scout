@@ -18,11 +18,13 @@ from arch.utility.exceptions import DataScaleWarning
 from vol_scout.data import multi_day_rv
 from vol_scout.models import (
     ForecastResult,
+    _har_feature_frame,
     forecast_garch,
     forecast_har_rv,
     forecast_random_walk,
     har_features,
     har_rv_coefficients,
+    lgbm_features,
 )
 
 # 30 hand-picked daily RV values (all realized RV proxies are non-negative,
@@ -36,6 +38,30 @@ _RV_30 = pd.Series(
 
 def _train_df(rv: pd.Series) -> pd.DataFrame:
     return pd.DataFrame({"rv": rv})
+
+
+def _ohlcv_rv_df(rv: pd.Series) -> pd.DataFrame:
+    """Synthetic OHLCV+rv frame for LightGBM tests: `rv` carries the actual
+    signal under test (hand-picked or simulated by the caller); open/high/
+    low/close are simple, deterministic placeholders (a mild trend with a
+    small fixed intraday range and no relationship to `rv` at all) -- just
+    enough to make `range_pct`/`overnight_gap` well-defined and non-constant
+    without them dominating whatever generating relationship a given test
+    puts into `rv`. DatetimeIndex (calendar features need real timestamps).
+    """
+    n = len(rv)
+    idx = pd.date_range("2020-01-01", periods=n, freq="D")
+    close = 100.0 + np.arange(n) * 0.01
+    return pd.DataFrame(
+        {
+            "open": close - 0.05,
+            "high": close + 0.1,
+            "low": close - 0.1,
+            "close": close,
+            "rv": rv.to_numpy(),
+        },
+        index=idx,
+    )
 
 
 def test_forecast_random_walk_returns_forecast_result():
@@ -279,3 +305,82 @@ def test_forecast_garch_percent_scaling_avoids_data_scale_warning():
         forecast_garch(_close_train_df(returns))
 
     assert not any(issubclass(w.category, DataScaleWarning) for w in caught)
+
+
+# --- LightGBM feature builder --------------------------------------------
+#
+# `lgbm_features(df, o)` reuses `_har_feature_frame` verbatim for its three
+# RV lags (module docstring: "LightGBM sees the same information HAR-RV
+# does, plus these extras") -- no parallel reimplementation of that window
+# logic. Unlike `har_features`, it does NOT raise on insufficient history:
+# it is a thin positional accessor into a fully vectorized frame, NaN
+# wherever a lag/gap window isn't realized yet (same graceful convention as
+# `_har_feature_frame`/`data.multi_day_rv`) -- this is what makes it
+# possible to hand-verify on a tiny 10-row frame at all (a 10-row frame can
+# never satisfy `har_features`'s own `origin_idx >= 21` floor).
+
+
+def test_lgbm_features_hand_computed_on_tiny_ten_row_frame():
+    # Explicit OHLC values, hand-picked so range_pct/overnight_gap are
+    # exactly computable; explicit independent rv values (same convention
+    # as `_RV_30` -- rv is a column already computed, not derived from
+    # OHLC). Dates chosen to land exactly on a real month-end (2021-01-31)
+    # for the calendar-feature check below.
+    idx = pd.date_range("2021-01-27", periods=10, freq="D")
+    open_ = pd.Series([100, 100, 101, 102, 103, 110, 111, 112, 113, 114], index=idx, dtype=float)
+    high = pd.Series([101, 102, 103, 104, 105, 112, 113, 114, 115, 116], index=idx, dtype=float)
+    low = pd.Series([99, 100, 100, 101, 102, 108, 109, 110, 111, 112], index=idx, dtype=float)
+    close = pd.Series([100, 101, 102, 103, 104, 111, 112, 113, 114, 115], index=idx, dtype=float)
+    rv = pd.Series([0.0001 * (i + 1) for i in range(10)], index=idx)
+    df = pd.DataFrame({"open": open_, "high": high, "low": low, "close": close, "rv": rv})
+
+    # o=5 (2021-02-01): lag_1/lag_5 fully realized, lag_22 NOT (only 6 rows
+    # of history exist) -- NaN, not a raise.
+    o = 5
+    features = lgbm_features(df, o)
+    assert features["lag_1"] == pytest.approx(math.log(rv.iloc[5]))
+    assert features["lag_5"] == pytest.approx(math.log(rv.iloc[1:6].mean()))
+    assert math.isnan(features["lag_22"])
+    assert features["range_pct"] == pytest.approx((112.0 - 108.0) / 111.0)
+    assert features["overnight_gap"] == pytest.approx(abs(110.0 - 104.0) / 104.0)
+    assert features["day_of_week"] == float(idx[5].dayofweek)
+    assert features["month"] == float(idx[5].month)
+    assert features["is_month_end"] == 0.0
+
+    # o=4 (2021-01-31) IS a real calendar month-end.
+    assert lgbm_features(df, 4)["is_month_end"] == 1.0
+
+    # o=0: no prior close at all -> overnight_gap is NaN, not a crash.
+    assert math.isnan(lgbm_features(df, 0)["overnight_gap"])
+    # range_pct never needs history -- defined even at o=0.
+    assert lgbm_features(df, 0)["range_pct"] == pytest.approx((101.0 - 99.0) / 100.0)
+
+
+def test_lgbm_features_rv_lags_match_har_feature_frame_exactly():
+    # Locks the reuse contract: lgbm_features's three RV lags are IDENTICAL
+    # to _har_feature_frame's output, not independently recomputed --
+    # guards a future refactor from silently letting the two diverge.
+    rv = pd.Series([0.0001 * (1.0 + 0.05 * math.sin(i / 3.0)) for i in range(60)])
+    df = _ohlcv_rv_df(rv)
+    har_frame = _har_feature_frame(rv)
+
+    for o in (21, 22, 40, 59):
+        features = lgbm_features(df, o)
+        assert features["lag_1"] == pytest.approx(har_frame["log_d"].iloc[o])
+        assert features["lag_5"] == pytest.approx(har_frame["log_w"].iloc[o])
+        assert features["lag_22"] == pytest.approx(har_frame["log_m"].iloc[o])
+
+
+def test_lgbm_calendar_features_depend_only_on_origin_timestamp():
+    # Structurally leak-proof -- computed purely from the origin's own
+    # timestamp, nothing to poison (plan M3.3's non-poison calendar check).
+    rv = pd.Series([0.0001 + 0.000001 * i for i in range(60)])
+    df = _ohlcv_rv_df(rv)
+    o = 40
+    ts = df.index[o]
+
+    features = lgbm_features(df, o)
+
+    assert features["day_of_week"] == float(ts.dayofweek)
+    assert features["month"] == float(ts.month)
+    assert features["is_month_end"] == float(ts.is_month_end)

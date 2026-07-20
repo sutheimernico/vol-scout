@@ -255,6 +255,72 @@ def forecast_garch(train_df: pd.DataFrame) -> ForecastResult:
     )
 
 
+# --- LightGBM feature builder ---------------------------------------------
+#
+# Reuses `_har_feature_frame` verbatim for its three RV lags -- lets the
+# README fairly claim "LightGBM sees the same information HAR-RV does, plus
+# these extras" (plan M3.1), not a different, parallel-reimplemented
+# information set. `range_pct`/`overnight_gap` are the "extras": distinct
+# signals from the RV proxies, raw (not logged). Calendar features
+# (`day_of_week`/`month`/`is_month_end`) come purely from the origin's own
+# timestamp -- always known, structurally leak-proof, nothing to poison.
+_LGBM_FEATURE_COLUMNS = [
+    "lag_1",
+    "lag_5",
+    "lag_22",
+    "range_pct",
+    "overnight_gap",
+    "day_of_week",
+    "month",
+    "is_month_end",
+]
+
+
+def _lgbm_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Vectorized feature frame for every position in `df`, one row per
+    origin, column order matching `_LGBM_FEATURE_COLUMNS`.
+
+    `lag_1`/`lag_5`/`lag_22` are `_har_feature_frame(df["rv"])`'s
+    `log_d`/`log_w`/`log_m` columns, reused unchanged (see section header) --
+    NaN wherever the weekly/monthly window isn't full yet. `range_pct` needs
+    no history (defined from row `o` alone); `overnight_gap` needs a prior
+    close (NaN at the first row). Calendar columns are always defined.
+    """
+    har = _har_feature_frame(df["rv"])
+    close = df["close"]
+    prev_close = close.shift(1)
+    idx = df.index
+    return pd.DataFrame(
+        {
+            "lag_1": har["log_d"],
+            "lag_5": har["log_w"],
+            "lag_22": har["log_m"],
+            "range_pct": (df["high"] - df["low"]) / close,
+            "overnight_gap": (df["open"] - prev_close).abs() / prev_close,
+            "day_of_week": idx.dayofweek.astype(float),
+            "month": idx.month.astype(float),
+            "is_month_end": idx.is_month_end.astype(float),
+        },
+        index=idx,
+    )
+
+
+def lgbm_features(df: pd.DataFrame, origin_idx: int) -> dict[str, float]:
+    """Per-origin LightGBM feature vector at position `origin_idx` (0-based):
+    a thin positional accessor into `_lgbm_feature_frame` (`.iloc
+    [origin_idx].to_dict()`).
+
+    Deliberately does NOT raise on insufficient history like `har_features`
+    does -- it is a read of an already-NaN-graceful vectorized frame (same
+    convention as `_har_feature_frame`/`data.multi_day_rv`), which is what
+    makes it hand-verifiable on a frame far shorter than 22 rows (`lag_22`
+    is simply `NaN` there, not an error). `forecast_lgbm`'s training-frame
+    `dropna()` -- not this accessor -- is where insufficient-history rows
+    get excluded before fitting.
+    """
+    return _lgbm_feature_frame(df).iloc[origin_idx].to_dict()
+
+
 MODEL_REGISTRY: dict[str, Callable[[pd.DataFrame], ForecastResult]] = {
     "random_walk": forecast_random_walk,
     "har_rv": forecast_har_rv,
