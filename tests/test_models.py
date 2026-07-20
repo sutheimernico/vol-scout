@@ -437,3 +437,89 @@ def test_forecast_lgbm_smoke_correlates_with_known_har_generating_signal():
 
 def test_lgbm_registered_in_model_registry():
     assert MODEL_REGISTRY["lgbm"] is forecast_lgbm
+
+
+# --- Anti-leakage sentinel: lgbm_features / targets ----------------------
+#
+# House sentinel style (timeseries_showdown/tests/test_baselines.py's
+# test_training_frame_features_never_touch_the_targets_own_or_future_value):
+# poison one specific day, hand-verify the EXACT boundary at which the
+# poison legitimately enters a target vs. must stay out of the features,
+# rather than a vague "no leak somewhere" assertion.
+
+
+def test_lgbm_features_and_targets_poison_value_boundaries():
+    n = 100
+    poison_day = 60
+    clean_rv = pd.Series([0.0001 + 0.000001 * i for i in range(n)])
+    rv = clean_rv.copy()
+    rv.iloc[poison_day] = 1e9  # sentinel: leaks if any feature picks it up early
+    df = _ohlcv_rv_df(rv)
+
+    target_h1 = np.log(rv.shift(-1))
+    target_h22 = np.log(multi_day_rv(rv, 22).shift(-22))
+
+    def assert_features_exclude_poison(o: int) -> None:
+        features = lgbm_features(df, o)
+        assert features["lag_1"] == pytest.approx(math.log(clean_rv.iloc[o]))
+        assert features["lag_5"] == pytest.approx(math.log(clean_rv.iloc[o - 4 : o + 1].mean()))
+        assert features["lag_22"] == pytest.approx(math.log(clean_rv.iloc[o - 21 : o + 1].mean()))
+        # Literal-passthrough check, on top of the exact-window checks above
+        # (which already close the "diluted leak through a rolling mean"
+        # blind spot a literal check alone would miss).
+        assert 1e9 not in features.values()
+        assert math.log(1e9) not in features.values()
+
+    # o well beyond both the 22-day feature and target windows: neither
+    # target reaches the poison at all -- coarse control.
+    o = poison_day - 30
+    assert target_h1.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1]))
+    assert target_h22.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1 : o + 23].sum()))
+    assert_features_exclude_poison(o)
+
+    # Sharpest "neither" control: o+23 is exactly one day PAST the h=22
+    # target's far edge (o+22) -- poison_day sits exactly one day outside
+    # the h=22 target window here, the tightest margin at which the poison
+    # must still be absent from everything (features AND both targets).
+    o = poison_day - 23
+    assert target_h1.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1]))
+    assert target_h22.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1 : o + 23].sum()))
+    assert_features_exclude_poison(o)
+
+    # o = poison_day - 22: the h=22 target's far edge reaches EXACTLY
+    # poison_day (sum(RV_{o+1..o+22}) includes it at the boundary) --
+    # legitimate, not a leak. Features at this SAME origin look only
+    # backward and must not see it.
+    o = poison_day - 22
+    assert target_h22.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1 : o + 22].sum() + 1e9))
+    assert_features_exclude_poison(o)
+
+    # o = poison_day - 1: the h=1 target legitimately equals the poison
+    # (tomorrow, relative to o, is poison_day). Features must not.
+    o = poison_day - 1
+    assert target_h1.iloc[o] == pytest.approx(math.log(1e9))
+    assert_features_exclude_poison(o)
+
+    # o = poison_day itself: lag_1 is DEFINED as the origin's own freshest
+    # value -- legitimately equals the poison here. The origin's own h=1/
+    # h=22 targets (strictly forward-looking) must NOT contain it yet.
+    o = poison_day
+    features = lgbm_features(df, o)
+    assert features["lag_1"] == pytest.approx(math.log(1e9))
+    assert target_h1.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1]))
+    assert target_h22.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1 : o + 23].sum()))
+
+
+def test_lgbm_calendar_features_are_structurally_leak_proof():
+    # Not a poison test -- there is nothing to poison. day_of_week/month/
+    # is_month_end are computed purely from the origin's own timestamp
+    # (plan M3.3's "one-line assertion, not a poison test" item).
+    rv = pd.Series([0.0001 + 0.000001 * i for i in range(80)])
+    df = _ohlcv_rv_df(rv)
+
+    for o in (21, 50, 79):
+        ts = df.index[o]
+        features = lgbm_features(df, o)
+        assert features["day_of_week"] == float(ts.dayofweek)
+        assert features["month"] == float(ts.month)
+        assert features["is_month_end"] == float(ts.is_month_end)
