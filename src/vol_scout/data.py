@@ -17,6 +17,20 @@ provider for the missing tail and merges it in, so previously-cached rows
 are never re-fetched or lost. Tests must never make live network calls --
 see `FakePriceProvider` in `tests/test_data.py`, which actively raises if
 asked to re-fetch an already-cached range.
+
+Volatility proxies, computed directly from OHLC bars (honest limitation #1
+from the design spec: these are proxies for realized volatility, not true
+realized volatility, which needs intraday data this project does not have).
+`parkinson_rv` is the primary proxy used downstream; `garman_klass_rv` and
+`squared_return_rv` are sensitivity checks -- each captures a different
+slice of the day's price action (intraday range vs. close-to-close), so
+they can and do disagree sharply on any single day (see
+`test_parkinson_and_garman_klass_sensitivity_vs_squared_return`). These are
+low-level, per-row primitives only; `multi_day_rv` is a dumb trailing
+rolling sum with no forecast-alignment logic -- callers (M2/M3/M5's target
+builders) own shifting it correctly relative to a forecast origin, mirroring
+the primitive/caller split `timeseries_showdown.baselines
+._rolling_as_of_origin` uses.
 """
 
 from __future__ import annotations
@@ -24,6 +38,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -114,3 +129,38 @@ def load_ohlcv(ticker: str, data_dir: Path) -> pd.DataFrame:
     path = _cache_path(ticker, data_dir)
     df = pd.read_csv(path, parse_dates=["date"])
     return df.set_index("date")[["open", "high", "low", "close", "volume"]]
+
+
+def log_return(df: pd.DataFrame) -> pd.Series:
+    """ln(C_t / C_{t-1}) per row; first value is NaN (no prior close)."""
+    return np.log(df["close"] / df["close"].shift(1))
+
+
+def squared_return_rv(df: pd.DataFrame) -> pd.Series:
+    """Squared close-to-close log return: literally `log_return(df) ** 2`.
+
+    Not a second, independent formula -- one definition, reused, so the two
+    can never drift apart.
+    """
+    return log_return(df) ** 2
+
+
+def parkinson_rv(df: pd.DataFrame) -> pd.Series:
+    """Parkinson (1980) range-based variance proxy: (1/(4*ln2)) * ln(H/L)**2."""
+    return (1.0 / (4.0 * np.log(2.0))) * np.log(df["high"] / df["low"]) ** 2
+
+
+def garman_klass_rv(df: pd.DataFrame) -> pd.Series:
+    """Garman-Klass (1980) variance proxy: 0.5*ln(H/L)**2 - (2*ln2-1)*ln(C/O)**2."""
+    log_hl = np.log(df["high"] / df["low"])
+    log_co = np.log(df["close"] / df["open"])
+    return 0.5 * log_hl**2 - (2.0 * np.log(2.0) - 1.0) * log_co**2
+
+
+def multi_day_rv(daily_rv: pd.Series, days: int) -> pd.Series:
+    """Trailing rolling sum of `days` daily RV values.
+
+    Deliberately dumb -- no forward/backward shifting relative to any
+    forecast origin. Callers own alignment (see module docstring).
+    """
+    return daily_rv.rolling(days).sum()

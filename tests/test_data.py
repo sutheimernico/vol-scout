@@ -9,11 +9,22 @@ guarantee than a plain call-count assertion.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
-from vol_scout.data import PriceProvider, fetch_and_cache_ohlcv, load_ohlcv
+from vol_scout.data import (
+    PriceProvider,
+    fetch_and_cache_ohlcv,
+    garman_klass_rv,
+    load_ohlcv,
+    log_return,
+    multi_day_rv,
+    parkinson_rv,
+    squared_return_rv,
+)
 
 
 class FakePriceProvider:
@@ -130,3 +141,120 @@ def test_load_ohlcv_reads_committed_csv_with_datetime_index(tmp_path: Path):
     assert isinstance(df.index, pd.DatetimeIndex)
     assert list(df.index) == [pd.Timestamp("2020-01-02"), pd.Timestamp("2020-01-03")]
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
+
+
+# --- volatility proxies ------------------------------------------------------
+#
+# Fixture rows (hand-picked so the expected numbers can be derived independently
+# of the implementation, via math.log directly, not by calling the functions
+# under test):
+#   row0: O=100, H=105, L=95,  C=100   (no prior close -> log_return NaN)
+#   row1: O=100, H=110, L=100, C=105   (prior close 100)
+#   row2: O=105, H=108, L=102, C=104   (prior close 105)
+#   row3: O=104, H=106, L=103, C=107   (prior close 104)
+
+_PROXY_FIXTURE = pd.DataFrame(
+    {
+        "open": [100.0, 100.0, 105.0, 104.0],
+        "high": [105.0, 110.0, 108.0, 106.0],
+        "low": [95.0, 100.0, 102.0, 103.0],
+        "close": [100.0, 105.0, 104.0, 107.0],
+    }
+)
+
+
+def test_log_return_hand_computed_and_first_row_is_nan():
+    result = log_return(_PROXY_FIXTURE)
+
+    assert pd.isna(result.iloc[0])
+    assert result.iloc[1] == pytest.approx(math.log(105.0 / 100.0))
+    assert result.iloc[2] == pytest.approx(math.log(104.0 / 105.0))
+    assert result.iloc[3] == pytest.approx(math.log(107.0 / 104.0))
+
+
+def test_squared_return_rv_hand_computed_and_first_row_is_nan():
+    result = squared_return_rv(_PROXY_FIXTURE)
+
+    assert pd.isna(result.iloc[0])
+    assert result.iloc[1] == pytest.approx(math.log(105.0 / 100.0) ** 2)
+    assert result.iloc[2] == pytest.approx(math.log(104.0 / 105.0) ** 2)
+    assert result.iloc[3] == pytest.approx(math.log(107.0 / 104.0) ** 2)
+
+
+def test_squared_return_rv_is_literally_log_return_squared():
+    # One definition, not two -- squared_return_rv must be exactly log_return**2.
+    lr = log_return(_PROXY_FIXTURE)
+    sq = squared_return_rv(_PROXY_FIXTURE)
+
+    pd.testing.assert_series_equal((lr**2).iloc[1:], sq.iloc[1:], check_names=False)
+
+
+def test_parkinson_rv_hand_computed():
+    ln2 = math.log(2.0)
+    expected = [
+        (1.0 / (4.0 * ln2)) * math.log(105.0 / 95.0) ** 2,
+        (1.0 / (4.0 * ln2)) * math.log(110.0 / 100.0) ** 2,
+        (1.0 / (4.0 * ln2)) * math.log(108.0 / 102.0) ** 2,
+        (1.0 / (4.0 * ln2)) * math.log(106.0 / 103.0) ** 2,
+    ]
+
+    result = parkinson_rv(_PROXY_FIXTURE)
+
+    for i, exp in enumerate(expected):
+        assert result.iloc[i] == pytest.approx(exp)
+
+
+def test_garman_klass_rv_hand_computed():
+    ln2 = math.log(2.0)
+    c = 2.0 * ln2 - 1.0
+    expected = [
+        0.5 * math.log(105.0 / 95.0) ** 2 - c * math.log(100.0 / 100.0) ** 2,
+        0.5 * math.log(110.0 / 100.0) ** 2 - c * math.log(105.0 / 100.0) ** 2,
+        0.5 * math.log(108.0 / 102.0) ** 2 - c * math.log(104.0 / 105.0) ** 2,
+        0.5 * math.log(106.0 / 103.0) ** 2 - c * math.log(107.0 / 104.0) ** 2,
+    ]
+
+    result = garman_klass_rv(_PROXY_FIXTURE)
+
+    for i, exp in enumerate(expected):
+        assert result.iloc[i] == pytest.approx(exp)
+
+
+def test_parkinson_and_garman_klass_sensitivity_vs_squared_return():
+    # row0: seed close only.
+    # row1: big intraday range (H/L = 120/80 = 1.5), nearly flat close-to-close
+    #       (100 -> 100.5) -- Parkinson/GK should dwarf the squared return.
+    # row2: narrow intraday range (H/L = 115.5/114.5), big close-to-close move
+    #       (100.5 -> 115.2) -- squared return should dwarf Parkinson/GK.
+    df = pd.DataFrame(
+        {
+            "open": [100.0, 100.0, 115.0],
+            "high": [101.0, 120.0, 115.5],
+            "low": [99.0, 80.0, 114.5],
+            "close": [100.0, 100.5, 115.2],
+        }
+    )
+
+    parkinson = parkinson_rv(df)
+    gk = garman_klass_rv(df)
+    sq = squared_return_rv(df)
+
+    # Row 1: big range, flat close -> Parkinson/GK >> squared return.
+    assert parkinson.iloc[1] > 100 * sq.iloc[1]
+    assert gk.iloc[1] > 100 * sq.iloc[1]
+
+    # Row 2: narrow range, big close move -> squared return >> Parkinson/GK.
+    assert sq.iloc[2] > 100 * parkinson.iloc[2]
+    assert sq.iloc[2] > 100 * gk.iloc[2]
+
+
+def test_multi_day_rv_trailing_rolling_sum_hand_verified():
+    s = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0])
+
+    result = multi_day_rv(s, 3)
+
+    assert pd.isna(result.iloc[0])
+    assert pd.isna(result.iloc[1])
+    assert result.iloc[2] == pytest.approx(s.iloc[0] + s.iloc[1] + s.iloc[2])
+    assert result.iloc[3] == pytest.approx(s.iloc[1] + s.iloc[2] + s.iloc[3])
+    assert result.iloc[4] == pytest.approx(s.iloc[2] + s.iloc[3] + s.iloc[4])
