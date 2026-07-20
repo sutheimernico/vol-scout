@@ -123,6 +123,18 @@ def test_har_features_raises_below_monthly_window():
         har_features(rv, 5)
 
 
+def test_har_rv_coefficients_raises_below_four_origins():
+    # n=23: the monthly-window floor (origin_idx>=21) and the h=1 target's
+    # own realized-ness (needs one more row after the origin) together
+    # leave exactly ONE fully-realized origin (idx=21) -- below the >=4
+    # floor OLS needs for its 4 parameters (fail-loud guard, untested until
+    # now).
+    rv = pd.Series([0.0001 + 0.000001 * i for i in range(23)])
+
+    with pytest.raises(ValueError):
+        har_rv_coefficients(rv, horizon=1)
+
+
 def _simulate_har_process(
     n: int,
     intercept: float,
@@ -294,6 +306,16 @@ def test_forecast_garch_returns_finite_positive_both_horizons():
     assert math.isfinite(result.point[22])
     assert result.point[1] > 0.0
     assert result.point[22] > 0.0
+
+
+def test_forecast_garch_raises_below_thirty_return_observations():
+    # 20 close prices -> 19 non-NaN log-returns after dropna -- below the
+    # >=30 floor forecast_garch needs to fit (fail-loud guard, untested
+    # until now).
+    returns = np.random.default_rng(0).normal(0.0, 0.01, 20)
+
+    with pytest.raises(ValueError):
+        forecast_garch(_close_train_df(returns))
 
 
 def test_forecast_garch_mean_reverts_down_after_a_large_shock():
@@ -469,6 +491,17 @@ def test_lgbm_registered_in_model_registry():
     assert MODEL_REGISTRY["lgbm"] is forecast_lgbm
 
 
+def test_forecast_lgbm_raises_below_min_training_rows():
+    # n=40: h=1's fully-realized origin count (21<=o<=cutoff-1 -> 18 rows)
+    # is already below the >=30 floor forecast_lgbm needs before fitting
+    # (fail-loud guard, untested until now).
+    rv = pd.Series([0.0001 + 0.000001 * i for i in range(40)])
+    df = _ohlcv_rv_df(rv)
+
+    with pytest.raises(ValueError):
+        forecast_lgbm(df)
+
+
 # --- Anti-leakage sentinel: lgbm_features / targets ----------------------
 #
 # House sentinel style (timeseries_showdown/tests/test_baselines.py's
@@ -538,6 +571,81 @@ def test_lgbm_features_and_targets_poison_value_boundaries():
     assert features["lag_1"] == pytest.approx(math.log(1e9))
     assert target_h1.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1]))
     assert target_h22.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1 : o + 23].sum()))
+
+
+def test_lgbm_ohlc_derived_features_poison_value_boundaries():
+    # The RV poison suite above poisons only the `rv` series -- it is
+    # structurally BLIND to a leak confined to range_pct/overnight_gap,
+    # which are derived purely from OHLC and never touch `rv` at all (e.g.
+    # a `range_pct = (high.shift(-1) - low) / close` bug would sail through
+    # every assertion above uncaught). This poisons the OHLC columns
+    # themselves and hand-verifies the same boundary precision for each of
+    # the three terms feeding the two OHLC-derived features: `high`
+    # (range_pct's numerator, zero temporal offset), `open` (overnight_gap's
+    # O_o term, zero temporal offset), and `close` -- the one column with
+    # TWO distinct legitimate touchpoints: range_pct's OWN-origin
+    # denominator, and overnight_gap's C_{o-1} term one day LATER.
+    n = 100
+    poison_day = 60
+    idx = pd.date_range("2020-01-01", periods=n, freq="D")
+    clean_close = 100.0 + np.arange(n) * 0.01
+    clean_open = clean_close - 0.05
+    clean_high = clean_close + 0.1
+    clean_low = clean_close - 0.1
+    rv = np.full(n, 0.0001)
+
+    def make_df(*, poison_high=False, poison_open=False, poison_close=False) -> pd.DataFrame:
+        high, open_, close = clean_high.copy(), clean_open.copy(), clean_close.copy()
+        if poison_high:
+            high[poison_day] = 1e9
+        if poison_open:
+            open_[poison_day] = 1e9
+        if poison_close:
+            close[poison_day] = 1e9
+        return pd.DataFrame(
+            {"open": open_, "high": high, "low": clean_low, "close": close, "rv": rv}, index=idx
+        )
+
+    def clean_range_pct(o: int) -> float:
+        return (clean_high[o] - clean_low[o]) / clean_close[o]
+
+    def clean_overnight_gap(o: int) -> float:
+        return abs(clean_open[o] - clean_close[o - 1]) / clean_close[o - 1]
+
+    control_origins = (poison_day - 30, poison_day - 1, poison_day + 1, poison_day + 30)
+
+    # --- high poisoned: range_pct's H_o term, no shift at all ------------
+    df_high = make_df(poison_high=True)
+    expected = (1e9 - clean_low[poison_day]) / clean_close[poison_day]
+    assert lgbm_features(df_high, poison_day)["range_pct"] == pytest.approx(expected)
+    for o in control_origins:
+        assert lgbm_features(df_high, o)["range_pct"] == pytest.approx(clean_range_pct(o))
+        assert lgbm_features(df_high, o)["overnight_gap"] == pytest.approx(clean_overnight_gap(o))
+
+    # --- open poisoned: overnight_gap's O_o term, no shift at all --------
+    df_open = make_df(poison_open=True)
+    expected = abs(1e9 - clean_close[poison_day - 1]) / clean_close[poison_day - 1]
+    assert lgbm_features(df_open, poison_day)["overnight_gap"] == pytest.approx(expected)
+    for o in control_origins:
+        assert lgbm_features(df_open, o)["overnight_gap"] == pytest.approx(clean_overnight_gap(o))
+        assert lgbm_features(df_open, o)["range_pct"] == pytest.approx(clean_range_pct(o))
+
+    # --- close poisoned: two distinct legitimate touchpoints -------------
+    df_close = make_df(poison_close=True)
+    expected_range_pct = (clean_high[poison_day] - clean_low[poison_day]) / 1e9
+    assert lgbm_features(df_close, poison_day)["range_pct"] == pytest.approx(expected_range_pct)
+    expected_gap_next_day = abs(clean_open[poison_day + 1] - 1e9) / 1e9
+    assert lgbm_features(df_close, poison_day + 1)["overnight_gap"] == pytest.approx(
+        expected_gap_next_day
+    )
+    # overnight_gap AT poison_day itself uses C_{poison_day-1} (clean,
+    # unrelated to the poison) -- must be unaffected by it.
+    assert lgbm_features(df_close, poison_day)["overnight_gap"] == pytest.approx(
+        clean_overnight_gap(poison_day)
+    )
+    for o in (poison_day - 30, poison_day - 1, poison_day + 2, poison_day + 30):
+        assert lgbm_features(df_close, o)["range_pct"] == pytest.approx(clean_range_pct(o))
+        assert lgbm_features(df_close, o)["overnight_gap"] == pytest.approx(clean_overnight_gap(o))
 
 
 def test_lgbm_calendar_features_are_structurally_leak_proof():
