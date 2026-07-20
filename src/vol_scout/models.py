@@ -57,7 +57,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import torch
 from arch import arch_model
+from chronos import BaseChronosPipeline
 from lightgbm import LGBMRegressor
 
 from vol_scout.data import log_return, multi_day_rv
@@ -396,6 +398,93 @@ def forecast_lgbm(train_df: pd.DataFrame) -> ForecastResult:
 
     elapsed = time.perf_counter() - start
     return ForecastResult(point=point, fit_predict_seconds=elapsed)
+
+
+# --- Chronos-2 zero-shot ---------------------------------------------------
+#
+# Zero-shot foundation-model contender (plan M4): no fitting at all, just a
+# forward pass through a pretrained model. Fed `log(RV)` (module docstring's
+# log-RV convention) -- consistent with HAR-RV/LightGBM, unlike GARCH's
+# structural exception.
+#
+# CPU feasibility (verified during M4.1, on this machine): model load
+# ~1s (weights already cached locally, no download), one
+# `predict_quantiles(prediction_length=22)` call on a ~2000-point context
+# ~0.2-0.4s -- comfortably under the plan's ~2s flag threshold, so no
+# compute valve (e.g. coarsening `STEP_TRADING_DAYS` for this model) is
+# needed for the M5 backtest's ~4000+ calls.
+#
+# Determinism (verified, not assumed): two calls on the identical context
+# return bit-for-bit identical quantiles -- Chronos-2's quantile head is not
+# sampling-based, so there is no seed of our own to set.
+CHRONOS2_MODEL_ID = "amazon/chronos-2"
+
+# ~2048 trading days (~8 years) of daily history -- not a hard model limit,
+# just a documented cap that keeps each forward pass fast and gives the
+# model several volatility regimes of history without materializing a
+# longer tensor than needed. Same constant value
+# `timeseries_showdown.foundation.CONTEXT_CAP` uses, for the same reason.
+CONTEXT_CAP = 2048
+
+_chronos2_pipeline: BaseChronosPipeline | None = None
+
+
+def _get_chronos2_pipeline() -> BaseChronosPipeline:
+    """Lazily load and cache the Chronos-2 pipeline (module-level singleton).
+
+    Lazy so importing this module never forces a model load -- tests that
+    only exercise pure helpers (e.g. `_capped_context`) stay fast, and the
+    M5 backtest script pays the ~1s load cost once per process, not once
+    per origin. Weights are pre-cached locally (`~/.cache/huggingface`); no
+    network call at test/run time.
+    """
+    global _chronos2_pipeline
+    if _chronos2_pipeline is None:
+        _chronos2_pipeline = BaseChronosPipeline.from_pretrained(
+            CHRONOS2_MODEL_ID, device_map="cpu", torch_dtype=torch.float32
+        )
+    return _chronos2_pipeline
+
+
+def _capped_context(series: pd.Series, context_cap: int) -> np.ndarray:
+    """Last `context_cap` observations of `series` (or all of it, if shorter).
+
+    Generic array-slicing helper, no vol-scout-specific logic -- same
+    contract as `timeseries_showdown.foundation._capped_context`.
+    """
+    values = np.asarray(series, dtype=float)
+    if len(values) > context_cap:
+        return values[-context_cap:]
+    return values
+
+
+def forecast_chronos2(
+    log_rv_series: pd.Series, horizon: int = 22, context_cap: int = CONTEXT_CAP
+) -> np.ndarray:
+    """Zero-shot Chronos-2 median (q50) forecast, on the LOG-RV scale.
+
+    `log_rv_series` is already `log(RV)` -- the caller's responsibility
+    (module docstring's log-RV convention: Chronos-2 receives log-RV, not
+    raw RV, same as HAR-RV/LightGBM). Returns the `horizon`-length q50
+    (median) path, still in LOG space -- callers (`_forecast_chronos2_
+    adapter`) exponentiate back to variance scale.
+
+    One `predict_quantiles(..., prediction_length=horizon)` call: Chronos-2's
+    own `model_prediction_length` is 1024 (verified in the sibling
+    `timeseries_showdown` project), comfortably above `horizon=22` -- no
+    library-internal autoregressive chunking, unlike Chronos-Bolt-small.
+    """
+    pipe = _get_chronos2_pipeline()
+    context = _capped_context(log_rv_series, context_cap).astype(np.float32)
+
+    quantiles, _mean = pipe.predict_quantiles(
+        inputs=[context], prediction_length=horizon, quantile_levels=[0.5]
+    )
+    # quantiles[0]: the single series in the batch, shape
+    # (n_variates=1, horizon, n_quantiles=1); [0][0] drops the (always-1,
+    # univariate) variate dim -> (horizon, 1); [:, 0] drops the
+    # single-quantile dim -> (horizon,).
+    return quantiles[0][0].numpy()[:, 0].astype(float)
 
 
 MODEL_REGISTRY: dict[str, Callable[[pd.DataFrame], ForecastResult]] = {

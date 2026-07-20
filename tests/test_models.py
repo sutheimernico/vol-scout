@@ -2,7 +2,14 @@
 
 No test in this module makes a network call. GARCH tests simulate their own
 GARCH(1,1) process (known omega/alpha/beta) rather than depending on real
-market data, so the ground truth is independently computable.
+market data, so the ground truth is independently computable. The Chronos-2
+tests are the one exception to "no model calls": most make a REAL forward
+pass against locally cached weights (`~/.cache/huggingface`) on tiny
+synthetic inputs -- a 200-400 point context predicting 22 steps takes well
+under a second on CPU (verified during M4.1's feasibility check) -- mocking
+the model would buy nothing but false confidence in the median/context-cap
+logic these tests exist to catch. Only `_capped_context`'s own unit tests
+avoid the model entirely (pure array slicing).
 """
 
 from __future__ import annotations
@@ -19,7 +26,10 @@ from vol_scout.data import multi_day_rv
 from vol_scout.models import (
     MODEL_REGISTRY,
     ForecastResult,
+    _capped_context,
+    _get_chronos2_pipeline,
     _har_feature_frame,
+    forecast_chronos2,
     forecast_garch,
     forecast_har_rv,
     forecast_lgbm,
@@ -661,3 +671,103 @@ def test_lgbm_calendar_features_are_structurally_leak_proof():
         assert features["day_of_week"] == float(ts.dayofweek)
         assert features["month"] == float(ts.month)
         assert features["is_month_end"] == float(ts.is_month_end)
+
+
+# --- Chronos-2 zero-shot (M4) ---------------------------------------------
+#
+# Zero-shot: no fitting, so there is no "known generating process" recovery
+# test like HAR-RV/LightGBM have -- correctness here means "the plumbing
+# (context capping, log-RV in, median out, h=1/h=22 derivation) is right,"
+# not "the forecast is accurate" (that question is M5/M6's backtest job).
+
+
+def _synthetic_log_rv_series(n: int = 250, seed: int = 7) -> pd.Series:
+    """A HAR-like, always-positive RV path in LOG space -- reuses
+    `_simulate_har_process` (already available in this file) purely because
+    it is a convenient realistic-shaped fixture, not because Chronos-2's
+    zero-shot forecast has any notion of "the correct model": unlike
+    HAR-RV/LightGBM, there is nothing to recover here.
+    """
+    intercept, beta_d, beta_w, beta_m = _HAR_GENERATING_COEFFICIENTS
+    rv = _simulate_har_process(
+        n=n, intercept=intercept, beta_d=beta_d, beta_w=beta_w, beta_m=beta_m,
+        noise_std=0.02, seed=seed,
+    )
+    return np.log(rv)
+
+
+def test_capped_context_truncates_to_last_n_points():
+    series = pd.Series(np.arange(3000, dtype=float))
+    capped = _capped_context(series, context_cap=2048)
+
+    assert len(capped) == 2048
+    np.testing.assert_allclose(capped, series.to_numpy()[-2048:])
+
+
+def test_capped_context_is_noop_when_series_shorter_than_cap():
+    series = pd.Series(np.arange(100, dtype=float))
+    capped = _capped_context(series, context_cap=2048)
+
+    assert len(capped) == 100
+    np.testing.assert_allclose(capped, series.to_numpy())
+
+
+def test_capped_context_tail_boundary_is_exact():
+    # Poison-style boundary check (house style, adapted -- pure array
+    # slicing, no model call): the value exactly ONE position before the
+    # cap's start must be excluded; the value exactly AT the cap's start
+    # must be the capped context's first element. Pins "last N", not some
+    # other off-by-one slice.
+    n, cap = 50, 20
+    series = pd.Series(np.arange(n, dtype=float))
+    series.iloc[n - cap - 1] = 1e9  # one before the boundary -> must be excluded
+    series.iloc[n - cap] = -1e9  # exactly at the boundary -> included, first element
+
+    capped = _capped_context(series, context_cap=cap)
+
+    assert len(capped) == cap
+    assert capped[0] == -1e9
+    assert 1e9 not in capped
+
+
+def test_forecast_chronos2_returns_median_array_of_correct_length():
+    result = forecast_chronos2(_synthetic_log_rv_series(), horizon=22)
+
+    assert isinstance(result, np.ndarray)
+    assert result.shape == (22,)
+    assert np.isfinite(result).all()
+
+
+def test_forecast_chronos2_respects_context_cap(monkeypatch):
+    # Same interception pattern as
+    # `timeseries_showdown.foundation`'s own context-cap test: spy on the
+    # pipeline's `predict_quantiles` and check the actual length of the
+    # context array it receives, rather than trusting the cap was applied.
+    pipe = _get_chronos2_pipeline()
+    captured: dict[str, int] = {}
+    real_predict_quantiles = pipe.predict_quantiles
+
+    def spy(inputs, prediction_length, quantile_levels):
+        captured["len"] = len(inputs[0])
+        return real_predict_quantiles(
+            inputs=inputs, prediction_length=prediction_length, quantile_levels=quantile_levels
+        )
+
+    monkeypatch.setattr(pipe, "predict_quantiles", spy)
+
+    long_series = np.log(pd.Series([0.0001] * 400))
+    forecast_chronos2(long_series, horizon=22, context_cap=300)
+
+    assert captured["len"] == 300
+
+
+def test_forecast_chronos2_is_deterministic_across_repeated_calls():
+    # Ground rule: verify determinism, don't assume it. Chronos-2's quantile
+    # head is not sampling-based, so two calls on the identical input should
+    # be bit-for-bit identical with no seed of our own to set.
+    series = _synthetic_log_rv_series()
+
+    first = forecast_chronos2(series, horizon=22)
+    second = forecast_chronos2(series, horizon=22)
+
+    np.testing.assert_array_equal(first, second)
