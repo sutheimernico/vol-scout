@@ -487,9 +487,40 @@ def forecast_chronos2(
     return quantiles[0][0].numpy()[:, 0].astype(float)
 
 
+def _forecast_chronos2_adapter(train_df: pd.DataFrame) -> ForecastResult:
+    """Chronos-2 adapter matching `MODEL_REGISTRY`'s `(train_df) ->
+    ForecastResult` contract (module docstring §6 / plan §6). Feeds
+    `log(RV)` to `forecast_chronos2` and derives both horizons from ONE
+    22-step-ahead call (plan §5, "Chronos-2 -> direct, one call"):
+
+    `point[1]` = the first day's exponentiated median.
+    `point[22]` = the SUM of all 22 days' exponentiated medians.
+
+    **Documented approximation, not hidden (plan M4.2's "known
+    subtlety"):** this is the sum of the per-step MEDIAN forecasts, not the
+    median of the SUM's own distribution --
+    `median(sum(X_1..X_22)) != sum(median(X_1)..median(X_22))` in general,
+    since summation and the median operator do not commute for a
+    non-degenerate joint distribution. Getting the true h=22 median would
+    need Chronos-2's own SAMPLE API (drawing joint sample paths and summing
+    each one before taking the empirical median across samples) -- noted
+    here as a possible future refinement, not built, since the quantile API
+    alone is what this task prescribes.
+    """
+    start = time.perf_counter()
+    median_log_path = forecast_chronos2(np.log(train_df["rv"]), horizon=22)
+    daily_medians = np.exp(median_log_path)
+    elapsed = time.perf_counter() - start
+    return ForecastResult(
+        point={1: float(daily_medians[0]), 22: float(daily_medians.sum())},
+        fit_predict_seconds=elapsed,
+    )
+
+
 MODEL_REGISTRY: dict[str, Callable[[pd.DataFrame], ForecastResult]] = {
     "random_walk": forecast_random_walk,
     "har_rv": forecast_har_rv,
     "garch": forecast_garch,
     "lgbm": forecast_lgbm,
+    "chronos2": _forecast_chronos2_adapter,
 }

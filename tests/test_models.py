@@ -27,6 +27,7 @@ from vol_scout.models import (
     MODEL_REGISTRY,
     ForecastResult,
     _capped_context,
+    _forecast_chronos2_adapter,
     _get_chronos2_pipeline,
     _har_feature_frame,
     forecast_chronos2,
@@ -771,3 +772,67 @@ def test_forecast_chronos2_is_deterministic_across_repeated_calls():
     second = forecast_chronos2(series, horizon=22)
 
     np.testing.assert_array_equal(first, second)
+
+
+# --- Chronos-2 registry adapter -------------------------------------------
+
+
+def test_chronos2_registered_in_model_registry():
+    assert MODEL_REGISTRY["chronos2"] is _forecast_chronos2_adapter
+
+
+def test_forecast_chronos2_adapter_returns_forecast_result_finite_positive_both_horizons():
+    rv = np.exp(_synthetic_log_rv_series())
+    df = _ohlcv_rv_df(rv)
+
+    result = _forecast_chronos2_adapter(df)
+
+    assert isinstance(result, ForecastResult)
+    assert isinstance(result.fit_predict_seconds, float)
+    assert result.fit_predict_seconds >= 0.0
+    assert math.isfinite(result.point[1])
+    assert math.isfinite(result.point[22])
+    assert result.point[1] > 0.0
+    assert result.point[22] > 0.0
+
+
+def test_forecast_chronos2_adapter_point_22_is_sum_of_exponentiated_daily_medians():
+    # Pins the documented h=22 approximation (module docstring / adapter
+    # docstring): the SUM of the per-step exponentiated medians, not a
+    # separately-derived number -- and point[1] is that same path's first
+    # exponentiated step.
+    rv = np.exp(_synthetic_log_rv_series())
+    df = _ohlcv_rv_df(rv)
+
+    result = _forecast_chronos2_adapter(df)
+    median_log_path = forecast_chronos2(np.log(df["rv"]), horizon=22)
+    daily_medians = np.exp(median_log_path)
+
+    assert result.point[1] == pytest.approx(float(daily_medians[0]))
+    assert result.point[22] == pytest.approx(float(daily_medians.sum()))
+
+
+def test_forecast_chronos2_adapter_never_sees_data_after_the_slice_boundary():
+    # Chronos-2 is zero-shot: `_forecast_chronos2_adapter` receives ONLY
+    # `train_df` (already sliced to the origin by the MODEL_REGISTRY
+    # contract's caller) -- unlike HAR-RV/LightGBM, it has no internal
+    # lag/target windowing of its own that could get an offset wrong.
+    # This pins the actual call-site invariant M5's `df.loc[:origin]`
+    # depends on: forecasts computed from an origin-sliced `train_df` are
+    # IDENTICAL no matter what a poisoned "future" tail (appended strictly
+    # AFTER the slice boundary, in the un-sliced source series) contains --
+    # the established poison-boundary style, adapted to a model with no
+    # windowing logic of its own to poison.
+    rv = np.exp(_synthetic_log_rv_series(n=300))
+    origin = 250
+
+    clean_df = _ohlcv_rv_df(rv.iloc[: origin + 1])
+    result_clean = _forecast_chronos2_adapter(clean_df)
+
+    poisoned_source = rv.copy()
+    poisoned_source.iloc[origin + 1 :] = 1e9  # poison strictly AFTER the origin
+    poisoned_df = _ohlcv_rv_df(poisoned_source.iloc[: origin + 1])  # same slice boundary
+    result_from_poisoned_source = _forecast_chronos2_adapter(poisoned_df)
+
+    assert result_clean.point[1] == pytest.approx(result_from_poisoned_source.point[1])
+    assert result_clean.point[22] == pytest.approx(result_from_poisoned_source.point[22])
