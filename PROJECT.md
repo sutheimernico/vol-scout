@@ -23,7 +23,16 @@ backtest reproducible from a fresh clone without needing network access at all
 past the initial fetch.
 
 ## Status
-- [ ] Task 0 — Scaffold
+- [x] Task 0 — Scaffold
+- [x] M1 — Data + volatility proxies (`data.py`: fetch+cache, Parkinson/
+  Garman-Klass/squared-return proxies, `multi_day_rv`; real OHLCV committed
+  for all 10 tickers)
+- [x] M2 — Benchmarks (`models.py`: `ForecastResult`/`MODEL_REGISTRY`,
+  random-walk, hand-implemented HAR-RV via OLS, GARCH(1,1) via `arch`)
+- [ ] M3 — LightGBM contender
+- [ ] M4 — Chronos-2 zero-shot
+- [ ] M5 — Rolling-origin backtest + statistics
+- [ ] M6 — Figures, README, Streamlit app
 
 ## Needs Nico
 - Git remote / public-visibility decision before any first push.
