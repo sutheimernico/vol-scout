@@ -50,11 +50,15 @@ differently:
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
+
+from vol_scout.data import multi_day_rv
 
 
 @dataclass
@@ -87,6 +91,108 @@ def forecast_random_walk(train_df: pd.DataFrame) -> ForecastResult:
     return ForecastResult(point={1: rv_o, 22: 22.0 * rv_o}, fit_predict_seconds=elapsed)
 
 
+# --- HAR-RV ------------------------------------------------------------
+#
+# Hand-implemented on purpose (plan: "the learning core") -- OLS via
+# `numpy.linalg.lstsq`, no `statsmodels`. Corsi (2009)'s three lags: daily
+# (the origin's own RV), weekly (trailing 5-day mean including the origin),
+# monthly (trailing 22-day mean including the origin) -- all backward-
+# looking, fit on `log(RV)` (module docstring's log-RV convention),
+# exponentiated back to variance scale in `forecast_har_rv`.
+
+
+def har_features(rv: pd.Series, origin_idx: int) -> tuple[float, float, float]:
+    """`(log(RV_o), log(mean(RV_{o-4..o})), log(mean(RV_{o-21..o})))` at
+    position `origin_idx` (0-based, `rv.iloc[origin_idx]`).
+
+    Note this is `log(mean(RV))`, not `mean(log(RV))` -- the mean is taken
+    on the raw RV window, then logged once.
+
+    Raises if `origin_idx < 21`: a full monthly window is required, rather
+    than silently averaging a partial one and returning a number that means
+    something different from every other origin's monthly lag (same
+    fail-loud-on-insufficient-history style as
+    `timeseries_showdown.baselines._require_rolling_history`).
+    """
+    if origin_idx < 21:
+        raise ValueError(
+            f"har_features needs origin_idx >= 21 for a full monthly window, got {origin_idx}"
+        )
+    daily = rv.iloc[origin_idx]
+    weekly = rv.iloc[origin_idx - 4 : origin_idx + 1].mean()
+    monthly = rv.iloc[origin_idx - 21 : origin_idx + 1].mean()
+    return math.log(daily), math.log(weekly), math.log(monthly)
+
+
+def _har_feature_frame(rv: pd.Series) -> pd.DataFrame:
+    """Vectorized `log(RV_d), log(RV_w), log(RV_m)` for every position in
+    `rv`, position-for-position equivalent to `har_features` (see the poison
+    boundary test) -- NaN wherever the weekly/monthly trailing window isn't
+    full yet, same "full window or NaN" convention as `data.multi_day_rv`.
+    Used to build the OLS training design matrix across many origins at
+    once, rather than looping `har_features` in Python per origin.
+    """
+    return pd.DataFrame(
+        {
+            "log_d": np.log(rv),
+            "log_w": np.log(rv.rolling(5).mean()),
+            "log_m": np.log(rv.rolling(22).mean()),
+        }
+    )
+
+
+def har_rv_coefficients(rv: pd.Series, horizon: int) -> np.ndarray:
+    """OLS fit (`numpy.linalg.lstsq`) of `log(sum(RV_{o+1..o+horizon}))` on
+    `[1, log(RV_o), log(mean(RV_{o-4..o})), log(mean(RV_{o-21..o}))]`, over
+    every origin `o` in `rv` where both sides are fully realized (features
+    need a full monthly window; the target needs `horizon` more days of
+    history after `o`) -- `multi_day_rv(rv, horizon).shift(-horizon)` is
+    `sum(RV_{o+1..o+horizon})` read AT `o` for any `horizon>=1` (h=1 falls
+    out of the same expression, since a rolling sum over 1 day is the day
+    itself), so h=1 and h=22 share this one implementation.
+
+    Returns `[intercept, beta_daily, beta_weekly, beta_monthly]`. Exposed
+    directly (not only via `forecast_har_rv`) so a test can verify the OLS
+    recovers known coefficients from a synthetic data-generating process,
+    independently of the final point-forecast wiring.
+    """
+    features = _har_feature_frame(rv)
+    target = np.log(multi_day_rv(rv, horizon).shift(-horizon))
+    design = features.assign(target=target).dropna()
+    if len(design) < 4:
+        raise ValueError(
+            f"har_rv_coefficients needs >=4 fully-realized origins to fit its 4 "
+            f"parameters, got {len(design)}"
+        )
+
+    x = np.column_stack([np.ones(len(design)), design["log_d"], design["log_w"], design["log_m"]])
+    y = design["target"].to_numpy()
+    coefficients, *_ = np.linalg.lstsq(x, y, rcond=None)
+    return coefficients
+
+
+def forecast_har_rv(train_df: pd.DataFrame) -> ForecastResult:
+    """Hand-implemented HAR-RV (Corsi 2009): two separately-fit OLS models
+    (h=1, h=22 -- module docstring's "direct" convention) on daily/weekly/
+    monthly `log(RV)` lags, applied once to the cutoff origin (`train_df`'s
+    last row) and exponentiated back to variance scale.
+    """
+    start = time.perf_counter()
+    rv = train_df["rv"].reset_index(drop=True)
+    cutoff_idx = len(rv) - 1
+
+    x_cutoff = np.array([1.0, *har_features(rv, cutoff_idx)])
+
+    point: dict[int, float] = {}
+    for horizon in (1, 22):
+        coefficients = har_rv_coefficients(rv, horizon)
+        point[horizon] = math.exp(float(x_cutoff @ coefficients))
+
+    elapsed = time.perf_counter() - start
+    return ForecastResult(point=point, fit_predict_seconds=elapsed)
+
+
 MODEL_REGISTRY: dict[str, Callable[[pd.DataFrame], ForecastResult]] = {
     "random_walk": forecast_random_walk,
+    "har_rv": forecast_har_rv,
 }
