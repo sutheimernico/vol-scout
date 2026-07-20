@@ -217,11 +217,41 @@ def test_har_features_and_targets_poison_value_boundaries():
     assert_features_exclude_poison(o)
 
     # o well beyond both the 22-day feature and target windows: neither
-    # target reaches the poison at all.
+    # target reaches the poison at all -- coarse control.
     o = poison_day - 30
     assert target_h1.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1]))
     assert target_h22.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1 : o + 23].sum()))
     assert_features_exclude_poison(o)
+
+    # Sharpest "neither" control: o+23 is exactly one day PAST the h=22
+    # target's far edge (o+22) -- poison_day sits exactly one day OUTSIDE
+    # the h=22 target window here, the tightest margin at which the poison
+    # must still be absent from everything (tighter than the -30 coarse
+    # control above).
+    o = poison_day - 23
+    assert target_h1.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1]))
+    assert target_h22.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1 : o + 23].sum()))
+    assert_features_exclude_poison(o)
+
+
+def test_har_features_matches_har_feature_frame_across_many_origins():
+    # Parity pin (M2 hardening finding): har_features (scalar, used at
+    # actual predict time in forecast_har_rv) and _har_feature_frame
+    # (vectorized, used to build the OLS training design matrix) must
+    # agree position-for-position -- a future refactor of either one that
+    # silently lets them diverge would desync what the model trains on
+    # from what it predicts with, without any single existing test
+    # noticing (the OLS-recovery test only exercises _har_feature_frame;
+    # the poison test above only exercises har_features).
+    rv = pd.Series([0.0001 * (1.0 + 0.05 * math.sin(i / 3.0)) for i in range(150)])
+    frame = _har_feature_frame(rv)
+
+    for o in range(21, len(rv)):
+        daily, weekly, monthly = har_features(rv, o)
+        row = frame.iloc[o]
+        assert daily == pytest.approx(row["log_d"])
+        assert weekly == pytest.approx(row["log_w"])
+        assert monthly == pytest.approx(row["log_m"])
 
 
 # --- GARCH(1,1) ----------------------------------------------------------
