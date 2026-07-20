@@ -29,7 +29,10 @@ past the initial fetch.
   for all 10 tickers)
 - [x] M2 — Benchmarks (`models.py`: `ForecastResult`/`MODEL_REGISTRY`,
   random-walk, hand-implemented HAR-RV via OLS, GARCH(1,1) via `arch`)
-- [ ] M3 — LightGBM contender
+- [x] M3 — LightGBM contender (`models.py`: `lgbm_features`/`_lgbm_feature_frame`
+  reusing HAR's RV lags + range/overnight-gap/calendar extras,
+  `forecast_lgbm` — two direct `LGBMRegressor` fits per origin, registered as
+  `"lgbm"`; full anti-leakage poison-boundary suite)
 - [ ] M4 — Chronos-2 zero-shot
 - [ ] M5 — Rolling-origin backtest + statistics
 - [ ] M6 — Figures, README, Streamlit app
