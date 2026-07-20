@@ -8,14 +8,17 @@ market data, so the ground truth is independently computable.
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
 import pandas as pd
 import pytest
+from arch.utility.exceptions import DataScaleWarning
 
 from vol_scout.data import multi_day_rv
 from vol_scout.models import (
     ForecastResult,
+    forecast_garch,
     forecast_har_rv,
     forecast_random_walk,
     har_features,
@@ -191,3 +194,88 @@ def test_har_features_and_targets_poison_value_boundaries():
     assert target_h1.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1]))
     assert target_h22.iloc[o] == pytest.approx(math.log(clean_rv.iloc[o + 1 : o + 23].sum()))
     assert_features_exclude_poison(o)
+
+
+# --- GARCH(1,1) ----------------------------------------------------------
+
+
+def _simulate_garch11(
+    n: int, omega: float, alpha: float, beta: float, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Simulate a real GARCH(1,1) return path with known omega/alpha/beta,
+    seeded at its own unconditional variance. Returns `(returns, sigma2)` --
+    `sigma2` is the ground-truth conditional variance path (never seen by
+    the model under test, which only gets `returns`).
+    """
+    rng = np.random.default_rng(seed)
+    returns = np.empty(n)
+    sigma2 = np.empty(n)
+    sigma2[0] = omega / (1.0 - alpha - beta)
+    returns[0] = rng.normal(0.0, math.sqrt(sigma2[0]))
+    for t in range(1, n):
+        sigma2[t] = omega + alpha * returns[t - 1] ** 2 + beta * sigma2[t - 1]
+        returns[t] = rng.normal(0.0, math.sqrt(sigma2[t]))
+    return returns, sigma2
+
+
+def _close_train_df(returns: np.ndarray) -> pd.DataFrame:
+    close = 100.0 * np.exp(np.cumsum(returns))
+    return pd.DataFrame({"close": close})
+
+
+_GARCH_OMEGA, _GARCH_ALPHA, _GARCH_BETA = 1e-6, 0.05, 0.90  # persistence 0.95, realistic equity vol
+
+
+def test_forecast_garch_returns_finite_positive_both_horizons():
+    returns, _ = _simulate_garch11(1500, _GARCH_OMEGA, _GARCH_ALPHA, _GARCH_BETA, seed=0)
+
+    result = forecast_garch(_close_train_df(returns))
+
+    assert isinstance(result, ForecastResult)
+    assert math.isfinite(result.point[1])
+    assert math.isfinite(result.point[22])
+    assert result.point[1] > 0.0
+    assert result.point[22] > 0.0
+
+
+def test_forecast_garch_mean_reverts_down_after_a_large_shock():
+    # A large shock immediately before the cutoff pushes the model's OWN
+    # filtered conditional variance at the origin well ABOVE its estimated
+    # long-run level -- the textbook GARCH forecast path then mean-reverts
+    # DOWNWARD over the horizon. This direction is a consequence of the
+    # forced shock's magnitude (8 std devs), not a hardcoded seed-dependent
+    # guess -- see the companion "tiny shock" test below for the mirror case.
+    returns, sigma2 = _simulate_garch11(1500, _GARCH_OMEGA, _GARCH_ALPHA, _GARCH_BETA, seed=0)
+    returns[-1] = 8.0 * math.sqrt(sigma2[-1])
+
+    result = forecast_garch(_close_train_df(returns))
+
+    avg_variance_over_horizon = result.point[22] / 22.0
+    assert avg_variance_over_horizon < result.point[1]
+
+
+def test_forecast_garch_mean_reverts_up_after_a_tiny_shock():
+    # Mirror case: a near-zero return immediately before the cutoff pushes
+    # the filtered conditional variance well BELOW the long-run level ->
+    # the forecast path mean-reverts UPWARD.
+    returns, sigma2 = _simulate_garch11(1500, _GARCH_OMEGA, _GARCH_ALPHA, _GARCH_BETA, seed=0)
+    returns[-1] = 0.001 * math.sqrt(sigma2[-1])
+
+    result = forecast_garch(_close_train_df(returns))
+
+    avg_variance_over_horizon = result.point[22] / 22.0
+    assert avg_variance_over_horizon > result.point[1]
+
+
+def test_forecast_garch_percent_scaling_avoids_data_scale_warning():
+    # `arch`'s own optimizer warns (DataScaleWarning) when fit on raw ~1%
+    # daily-vol returns -- the well-known gotcha this project's ``* 100``
+    # scaling (module docstring) exists to avoid. Pin that the scaling is
+    # actually applied: no DataScaleWarning on a realistic-scale series.
+    returns, _ = _simulate_garch11(1500, _GARCH_OMEGA, _GARCH_ALPHA, _GARCH_BETA, seed=1)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        forecast_garch(_close_train_df(returns))
+
+    assert not any(issubclass(w.category, DataScaleWarning) for w in caught)

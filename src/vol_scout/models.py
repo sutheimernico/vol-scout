@@ -57,8 +57,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from arch import arch_model
 
-from vol_scout.data import multi_day_rv
+from vol_scout.data import log_return, multi_day_rv
 
 
 @dataclass
@@ -192,7 +193,70 @@ def forecast_har_rv(train_df: pd.DataFrame) -> ForecastResult:
     return ForecastResult(point=point, fit_predict_seconds=elapsed)
 
 
+# --- GARCH(1,1) ----------------------------------------------------------
+#
+# Via the `arch` package -- the classical benchmark being compared AGAINST,
+# not "the learning core" (that's HAR-RV, hand-rolled deliberately, see
+# above); `arch` is the standard, actively-maintained Python GARCH
+# implementation, and hand-rolling a GARCH MLE would reimplement well-tested
+# numerical optimization for no benefit here.
+_GARCH_FORECAST_HORIZON = 22
+
+
+def forecast_garch(train_df: pd.DataFrame) -> ForecastResult:
+    """GARCH(1,1), fit on daily log-returns (`data.log_return`, NOT the `rv`
+    column -- module docstring's structural exception), converted back to
+    daily-variance units.
+
+    **Percent-scaling convention (pin this exactly, it is a classic silent
+    factor-100 trap):** `arch`'s own optimizer is numerically unstable on
+    raw returns of ~1% daily magnitude and emits a `DataScaleWarning`
+    recommending values roughly in `[1, 1000]` -- so we fit on
+    `returns * 100` (percent-return units; variance in that space is
+    `100**2 = 10_000` times the daily-variance-scale value). `res.forecast
+    (horizon=22)` returns its variance path in that SAME percent-return**2
+    scale, so before returning anything we divide by `100.0 ** 2` to land
+    back in the daily-variance units every other model/proxy in this
+    project uses (module docstring's binding scale convention). Getting
+    either factor wrong (or only doing one of the two) is exactly the
+    "silent factor-100" bug this docstring exists to prevent -- see
+    `tests/test_models.py::test_forecast_garch_percent_scaling_avoids_data
+    _scale_warning` for the round-trip pin.
+
+    `fc.variance.iloc[-1]` is read positionally (`.to_numpy()`), not by
+    column name (`h.01`, `h.02`, ... in the installed `arch` 8.0 -- the
+    plan flagged this naming as version-sensitive; position is guaranteed
+    order regardless of the exact zero-padding a given version uses).
+
+    h=22 uses the iterated aggregation from the module docstring: one
+    `.forecast(horizon=22)` call gives the analytic 22-step-ahead variance
+    path in a single shot (`arch` runs the GARCH(1,1) recursion internally,
+    no manual recursion needed); `point[1]` is that path's first step,
+    `point[22]` is the sum of all 22 steps.
+    """
+    start = time.perf_counter()
+    returns = log_return(train_df).dropna()
+    if len(returns) < 30:
+        raise ValueError(
+            f"forecast_garch needs >=30 return observations to fit, got {len(returns)}"
+        )
+
+    am = arch_model(
+        returns.to_numpy() * 100.0, mean="Constant", vol="Garch", p=1, q=1, dist="normal"
+    )
+    res = am.fit(disp="off")
+    fc = res.forecast(horizon=_GARCH_FORECAST_HORIZON, reindex=False)
+    variance = fc.variance.iloc[-1].to_numpy() / 100.0**2  # percent^2 -> daily-variance scale
+
+    elapsed = time.perf_counter() - start
+    return ForecastResult(
+        point={1: float(variance[0]), 22: float(variance.sum())},
+        fit_predict_seconds=elapsed,
+    )
+
+
 MODEL_REGISTRY: dict[str, Callable[[pd.DataFrame], ForecastResult]] = {
     "random_walk": forecast_random_walk,
     "har_rv": forecast_har_rv,
+    "garch": forecast_garch,
 }
