@@ -33,7 +33,10 @@ past the initial fetch.
   reusing HAR's RV lags + range/overnight-gap/calendar extras,
   `forecast_lgbm` — two direct `LGBMRegressor` fits per origin, registered as
   `"lgbm"`; full anti-leakage poison-boundary suite)
-- [ ] M4 — Chronos-2 zero-shot
+- [ ] M4 — Chronos-2 zero-shot (`models.py`: `forecast_chronos2`/
+  `_forecast_chronos2_adapter` on log(RV), registered as `"chronos2"`;
+  CPU feasibility verified, ~0.2-0.4s/call; full backtest run deferred,
+  needs M5.1's window config first)
 - [ ] M5 — Rolling-origin backtest + statistics
 - [ ] M6 — Figures, README, Streamlit app
 
