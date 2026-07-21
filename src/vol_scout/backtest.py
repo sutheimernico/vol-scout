@@ -54,11 +54,26 @@ computed result and must be recorded as one to keep resumability lossless.
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 import pandas as pd
 
 from vol_scout.data import multi_day_rv
 from vol_scout.models import MODEL_REGISTRY, ForecastResult
+
+# results/forecasts.csv's persistence contract (plan §7) plus the `error`
+# column extension (`run_all_models`'s module docstring) -- the exact,
+# ordered column set `run_and_append_resumable` writes.
+_FORECASTS_COLUMNS = [
+    "model",
+    "ticker",
+    "origin",
+    "horizon",
+    "rv_true",
+    "rv_pred",
+    "fit_predict_seconds",
+    "error",
+]
 
 # Production backtest config (design-decision §2). OOS_START is the first
 # trading day of 2018 -- the backtest spans Feb 2018's vol spike, the Dec
@@ -190,3 +205,85 @@ def run_all_models(
                 )
 
     return pd.DataFrame(rows)
+
+
+def _existing_forecast_keys(path: Path) -> set[tuple[str, str, str]]:
+    """`(model, ticker, origin)` triples already on disk at `path`, `origin`
+    read back as the exact ISO date STRING it was written as (no datetime
+    round-trip parsing -- see `run_and_append_resumable`'s docstring on why
+    string equality is the simplest correct comparison here). Empty set for
+    a missing or empty file.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return set()
+    existing = pd.read_csv(path, usecols=["model", "ticker", "origin"], dtype=str)
+    return set(zip(existing["model"], existing["ticker"], existing["origin"], strict=True))
+
+
+def run_and_append_resumable(
+    df: pd.DataFrame,
+    ticker: str,
+    origins: list[pd.Timestamp],
+    models: dict[str, Callable[[pd.DataFrame], ForecastResult]],
+    forecasts_path: Path,
+) -> dict:
+    """Run `models` over `origins` for `ticker`, appending only the NEW
+    rows to the shared, resumable `results/forecasts.csv`-shaped CSV at
+    `forecasts_path` (plan Ground rule 8: "a killed run resumes
+    losslessly"). This is the one function `scripts/run_backtest.py` (the
+    four cheap-to-refit models) and `scripts/run_chronos2.py` (the
+    foundation model, its own script per the plan's precedent) both call,
+    so the resumability contract lives in exactly one place instead of
+    twice.
+
+    Skip granularity is `(model, ticker, origin)`, not per-origin or
+    per-model wholesale: a prior run that finished model A for origin `o`
+    but was killed before starting model B on the same `o` resumes by
+    running ONLY B for `o` -- A is never re-run (wasted compute) and never
+    duplicated (a second row for the same triple, corrupting every
+    downstream per-origin comparison that assumes exactly one row per
+    triple). `origin` is written to the CSV as an ISO `YYYY-MM-DD` string,
+    and the skip-set comparison reads it back as a string too -- exact
+    string equality, deliberately avoiding any datetime dtype/format
+    round-trip subtlety a `pd.Timestamp` re-parse could introduce.
+
+    Creates `forecasts_path` (and its parent directory) with a header if
+    it does not exist yet; appends without a header otherwise. Different
+    tickers sharing the same origin dates are never confused for each
+    other's work (the ticker is part of the skip key).
+
+    Returns `{"rows_written": <new rows appended this call>, "failures":
+    <of those, how many have a non-empty "error">}` -- the caller (a
+    `scripts/*.py` runner) aggregates this across tickers for its own
+    console summary; `results/metrics.json`'s `meta` block is the
+    artifact-level record of the same count (plan's "count and report
+    failures" requirement).
+    """
+    forecasts_path = Path(forecasts_path)
+    forecasts_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _existing_forecast_keys(forecasts_path)
+    write_header = not forecasts_path.exists() or forecasts_path.stat().st_size == 0
+
+    rows_written = 0
+    failures = 0
+    for origin in origins:
+        origin_str = origin.strftime("%Y-%m-%d")
+        pending = {
+            name: fn for name, fn in models.items() if (name, ticker, origin_str) not in existing
+        }
+        if not pending:
+            continue
+
+        batch = run_all_models(df, [origin], models=pending)
+        batch.insert(1, "ticker", ticker)
+        batch["origin"] = batch["origin"].apply(lambda ts: ts.strftime("%Y-%m-%d"))
+        batch = batch[_FORECASTS_COLUMNS]
+
+        batch.to_csv(forecasts_path, mode="a", header=write_header, index=False)
+        write_header = False
+
+        rows_written += len(batch)
+        failures += int((batch["error"] != "").sum())
+        existing.update((name, ticker, origin_str) for name in pending)
+
+    return {"rows_written": rows_written, "failures": failures}

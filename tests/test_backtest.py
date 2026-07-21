@@ -18,6 +18,7 @@ from vol_scout.backtest import (
     STEP_TRADING_DAYS,
     make_origins,
     run_all_models,
+    run_and_append_resumable,
     target_rv,
 )
 from vol_scout.data import load_ohlcv, parkinson_rv
@@ -343,3 +344,118 @@ def test_run_all_models_smoke_on_real_spy_data_random_walk_only():
 def _dummy_random_walk(train_df: pd.DataFrame) -> ForecastResult:
     rv_o = float(train_df["rv"].iloc[-1])
     return ForecastResult(point={1: rv_o, 22: 22.0 * rv_o}, fit_predict_seconds=0.0)
+
+
+# --- run_and_append_resumable: the house resumable-CSV pattern -------------
+
+
+def test_run_and_append_resumable_creates_file_with_expected_rows(tmp_path):
+    df = _synthetic_df(200)
+    oos_start = df.index[100]
+    origins = make_origins(df, oos_start=oos_start, step_trading_days=5)
+    out_path = tmp_path / "forecasts.csv"
+
+    summary = run_and_append_resumable(
+        df, "TICK", origins[:3], {"random_walk": _dummy_random_walk}, out_path
+    )
+
+    assert summary == {"rows_written": 3 * len(HORIZONS), "failures": 0}
+    written = pd.read_csv(out_path)
+    assert len(written) == 3 * len(HORIZONS)
+    assert set(written.columns) == {
+        "model", "ticker", "origin", "horizon", "rv_true", "rv_pred",
+        "fit_predict_seconds", "error",
+    }
+    assert (written["ticker"] == "TICK").all()
+    assert (written["error"].fillna("") == "").all()
+
+
+def test_run_and_append_resumable_second_call_never_recomputes_done_triples(tmp_path):
+    """The core resumability guarantee -- pattern from `tests/test_data.py`'s
+    `FakePriceProvider`, which raises if asked to re-fetch an already-cached
+    range: here, a spy model raises if it is ever called for an origin
+    that a PRIOR call already recorded in the CSV.
+    """
+    df = _synthetic_df(200)
+    oos_start = df.index[100]
+    origins = make_origins(df, oos_start=oos_start, step_trading_days=5)
+    out_path = tmp_path / "forecasts.csv"
+
+    run_and_append_resumable(
+        df, "TICK", origins[:3], {"random_walk": _dummy_random_walk}, out_path
+    )
+
+    done_origins = set(origins[:3])
+
+    def raise_if_already_done(train_df: pd.DataFrame) -> ForecastResult:
+        if train_df.index[-1] in done_origins:
+            raise AssertionError("model called again for an origin already on disk")
+        return _dummy_random_walk(train_df)
+
+    summary = run_and_append_resumable(
+        df, "TICK", origins[:5], {"random_walk": raise_if_already_done}, out_path
+    )
+    # only origins[3] and origins[4] are new.
+    assert summary == {"rows_written": 2 * len(HORIZONS), "failures": 0}
+    written = pd.read_csv(out_path)
+    assert len(written) == 5 * len(HORIZONS)
+
+
+def test_run_and_append_resumable_resumes_per_model_not_just_per_origin(tmp_path):
+    """A run killed halfway through one origin's model loop must resume at
+    (model, origin) granularity: if model A finished for origin `o` but
+    model B did not, a re-run only redoes B for `o`, never re-running A.
+    """
+    df = _synthetic_df(200)
+    oos_start = df.index[100]
+    origins = make_origins(df, oos_start=oos_start, step_trading_days=5)
+    out_path = tmp_path / "forecasts.csv"
+
+    # first call: only model "a" runs for these origins (simulating a run
+    # that got killed after finishing "a" but before starting "b").
+    run_and_append_resumable(df, "TICK", origins[:2], {"a": _dummy_random_walk}, out_path)
+
+    calls: list[str] = []
+
+    def spy_a(train_df: pd.DataFrame) -> ForecastResult:
+        calls.append("a")
+        return _dummy_random_walk(train_df)
+
+    def spy_b(train_df: pd.DataFrame) -> ForecastResult:
+        calls.append("b")
+        return _dummy_random_walk(train_df)
+
+    summary = run_and_append_resumable(
+        df, "TICK", origins[:2], {"a": spy_a, "b": spy_b}, out_path
+    )
+    assert calls == ["b", "b"]  # "a" never re-run, "b" runs for both origins
+    assert summary == {"rows_written": 2 * len(HORIZONS), "failures": 0}
+
+
+def test_run_and_append_resumable_counts_failures_in_summary(tmp_path):
+    df = _synthetic_df(200)
+    oos_start = df.index[100]
+    origins = make_origins(df, oos_start=oos_start, step_trading_days=5)
+    out_path = tmp_path / "forecasts.csv"
+
+    def always_fails(train_df: pd.DataFrame) -> ForecastResult:
+        raise RuntimeError("boom")
+
+    summary = run_and_append_resumable(df, "TICK", origins[:2], {"broken": always_fails}, out_path)
+    assert summary == {"rows_written": 2 * len(HORIZONS), "failures": 2 * len(HORIZONS)}
+
+
+def test_run_and_append_resumable_different_tickers_do_not_collide(tmp_path):
+    df = _synthetic_df(200)
+    oos_start = df.index[100]
+    origins = make_origins(df, oos_start=oos_start, step_trading_days=5)
+    out_path = tmp_path / "forecasts.csv"
+
+    run_and_append_resumable(df, "AAA", origins[:2], {"random_walk": _dummy_random_walk}, out_path)
+    summary = run_and_append_resumable(
+        df, "BBB", origins[:2], {"random_walk": _dummy_random_walk}, out_path
+    )
+    # same origins, different ticker -- must NOT be skipped as already-done.
+    assert summary == {"rows_written": 2 * len(HORIZONS), "failures": 0}
+    written = pd.read_csv(out_path)
+    assert set(written["ticker"].unique()) == {"AAA", "BBB"}
