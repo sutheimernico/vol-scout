@@ -1,4 +1,4 @@
-"""Recompute `results/metrics.json` from the committed `results/
+"""Recompute `results/metrics.json` from the local `results/
 forecasts.csv` (plan §7's persistence contract): QLIKE (primary)/RMSE/
 Mincer-Zarnowitz per `(model, ticker, horizon)`, plus the headline
 model-vs-HAR-RV DM/HLN verdicts on SPY (the series every headline README
@@ -6,7 +6,7 @@ number is about, plan §1).
 
 Thin wiring script, no metric math of its own: `stats.py` defines every
 metric, `backtest.py` defines the window/origin contracts -- this script
-only reads the committed forecasts back and calls them, so `results/
+only reads the stored forecasts back and calls them, so `results/
 metrics.json` is regenerable from `results/forecasts.csv` alone, with no
 model refitting (same split the sibling `timeseries_showdown` project's
 `scripts/compute_pairwise_stats.py` uses, for the identical reason).

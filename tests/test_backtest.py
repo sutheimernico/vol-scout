@@ -8,6 +8,8 @@ can verify by re-reading the fixture, not an opaque end-to-end number.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -23,6 +25,11 @@ from vol_scout.backtest import (
 )
 from vol_scout.data import load_ohlcv, parkinson_rv
 from vol_scout.models import ForecastResult
+
+# Price CSVs are not shipped (see README); run scripts/fetch_data.py to enable these.
+requires_spy_data = pytest.mark.skipif(
+    not Path("data/SPY.csv").exists(), reason="data/SPY.csv missing (run scripts/fetch_data.py)"
+)
 
 
 def _synthetic_df(n_rows: int, start: str = "2017-01-02") -> pd.DataFrame:
@@ -90,6 +97,7 @@ def test_make_origins_raises_when_no_origin_has_full_horizon():
 # --- make_origins: real SPY data --------------------------------------------
 
 
+@requires_spy_data
 def test_make_origins_real_data_uses_production_constants():
     df = load_ohlcv("SPY", "data")
     origins = make_origins(df, oos_start=OOS_START, step_trading_days=STEP_TRADING_DAYS)
@@ -97,12 +105,14 @@ def test_make_origins_real_data_uses_production_constants():
     assert origins[0] == pd.Timestamp(OOS_START)
 
 
+@requires_spy_data
 def test_make_origins_real_data_origins_are_real_trading_days():
     df = load_ohlcv("SPY", "data")
     origins = make_origins(df, oos_start=OOS_START, step_trading_days=STEP_TRADING_DAYS)
     assert all(o in df.index for o in origins)
 
 
+@requires_spy_data
 def test_make_origins_real_data_h1_windows_never_overlap():
     df = load_ohlcv("SPY", "data")
     origins = make_origins(df, oos_start=OOS_START, step_trading_days=STEP_TRADING_DAYS)
@@ -113,6 +123,7 @@ def test_make_origins_real_data_h1_windows_never_overlap():
     assert len(h1_days) == len(set(h1_days))
 
 
+@requires_spy_data
 def test_make_origins_real_data_h22_windows_overlap_by_22_minus_step():
     df = load_ohlcv("SPY", "data")
     origins = make_origins(df, oos_start=OOS_START, step_trading_days=STEP_TRADING_DAYS)
@@ -329,6 +340,7 @@ def test_run_all_models_failure_in_one_model_does_not_affect_another():
 # --- run_all_models: real end-to-end smoke on real SPY data ----------------
 
 
+@requires_spy_data
 def test_run_all_models_smoke_on_real_spy_data_random_walk_only():
     df = load_ohlcv("SPY", "data")
     df["rv"] = parkinson_rv(df)

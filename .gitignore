@@ -6,3 +6,6 @@ __pycache__/
 .env.*
 !.env.example
 results/*.csv
+data/*.csv
+!data/.gitkeep
+.claude/

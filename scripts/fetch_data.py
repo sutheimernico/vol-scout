@@ -1,8 +1,9 @@
 """Fetch and cache OHLCV history for the vol-scout ten-ticker universe.
 
 The one legitimate live network call in this project: everything else
-(tests, models, backtest) runs against the committed CSVs this script
-produces in `data/`. Safe to re-run -- `fetch_and_cache_ohlcv` only fetches
+(tests, models, backtest) runs against the local CSV cache this script
+produces in `data/` (git-ignored; Yahoo Finance data is not redistributed
+in this repository). Safe to re-run -- `fetch_and_cache_ohlcv` only fetches
 the missing tail on top of whatever is already cached.
 """
 
